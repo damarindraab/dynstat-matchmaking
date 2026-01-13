@@ -51,6 +51,7 @@ Hard constraints:
     - RegionLatencyMaxMs: filters tickets by acceptable latency for preferred regions.
 - Ticket:
     - players[*].attributes is where stat codes live (e.g., MMR/ELO). Matching may average these across players in a ticket.
+    - ticket_attributes should include a per-player stat selection mapping: `{playerID: "stat_code"}`.
     - latencies map[string]int64 provides region → ms; per ticket; can be used to filter by region preferences or RegionLatencyMaxMs.
     - party_session_id groups users into a Party which must be placed together on one team.
 - Match vs BackfillTicket.PartialMatch:

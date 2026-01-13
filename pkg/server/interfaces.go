@@ -9,9 +9,8 @@ import (
 	"matchmaking-function-grpc-plugin-server-go/pkg/matchmaker"
 )
 
-type MatchMaker struct {
-	unmatchedTickets []matchmaker.Ticket
-}
+// MatchMaker implements the MatchLogic interface for character-specific MMR matchmaking
+type MatchMaker struct{}
 
 /*
 MatchLogic is a thing that has logic to take Tickets and make Matches. It also can decode match rules from json

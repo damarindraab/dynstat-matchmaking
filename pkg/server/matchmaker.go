@@ -7,18 +7,12 @@ package server
 import (
 	"encoding/json"
 	"fmt"
-	"slices"
-	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
 	"matchmaking-function-grpc-plugin-server-go/pkg/common"
 	"matchmaking-function-grpc-plugin-server-go/pkg/matchmaker"
-	matchfunction "matchmaking-function-grpc-plugin-server-go/pkg/pb"
-	"matchmaking-function-grpc-plugin-server-go/pkg/playerdata"
-
-	pie_ "github.com/elliotchance/pie/v2"
 )
 
 // New returns a MatchMaker of the MatchLogic interface
@@ -26,37 +20,184 @@ func New() MatchLogic {
 	return MatchMaker{}
 }
 
-// ValidateTicket returns a bool if the match ticket is valid
+// GetStatCodes returns the stat codes configured in the rules
+func (b MatchMaker) GetStatCodes(scope *common.Scope, matchRules interface{}) []string {
+	log := scope.Log.With("method", "MatchMaker.GetStatCodes")
+
+	rule, ok := matchRules.(GameRules)
+	if !ok {
+		log.Error("unexpected game rule type", "type", fmt.Sprintf("%T", matchRules))
+
+		return []string{}
+	}
+
+	// If no statistics configured, return empty
+	if len(rule.Statistics.Statistics) == 0 {
+		log.Info("no statistics configured, returning empty stat codes")
+
+		return []string{}
+	}
+
+	log.Info("returning stat codes", "codes", rule.Statistics.Statistics)
+
+	return rule.Statistics.Statistics
+}
+
+// ValidateTicket validates that the ticket has a valid selected stat
 func (b MatchMaker) ValidateTicket(scope *common.Scope, matchTicket matchmaker.Ticket, matchRules interface{}) (bool, error) {
-	scope.Log.Info("MATCHMAKER: validate ticket")
-	scope.Log.Info("Ticket Validation successful")
+	log := scope.Log.With("method", "MatchMaker.ValidateTicket", "ticketID", matchTicket.TicketID)
+	log.Info("validating ticket")
+	log.Info("ticket/rules snapshot", "ticket", matchTicket, "rules", matchRules)
+
+	rule, ok := matchRules.(GameRules)
+	if !ok {
+		log.Error("unexpected game rule type", "type", fmt.Sprintf("%T", matchRules))
+
+		return false, status.Error(codes.Internal, "invalid game rules type")
+	}
+
+	// If no statistics configured, skip validation
+	if len(rule.Statistics.Statistics) == 0 {
+		log.Info("no statistics config, skipping validation")
+
+		return true, nil
+	}
+
+	// Validate each player in the ticket
+	for _, player := range matchTicket.Players {
+		playerLog := log.With("playerID", player.PlayerID)
+
+		// Get selected stat from ticket attributes using player ID
+		selectedStatRaw, exists := matchTicket.TicketAttributes[string(player.PlayerID)]
+		if !exists {
+			playerLog.Error("player missing selected stat mapping", "key", player.PlayerID)
+
+			return false, status.Errorf(codes.InvalidArgument,
+				"player %s missing required stat mapping", player.PlayerID)
+		}
+
+		selectedStat, ok := selectedStatRaw.(string)
+		if !ok {
+			playerLog.Error("selected stat is not a string", "value", selectedStatRaw)
+
+			return false, status.Errorf(codes.InvalidArgument,
+				"player %s: selected stat must be a string", player.PlayerID)
+		}
+
+		// Validate stat is in allowed list
+		if !rule.Statistics.IsValidStat(selectedStat) {
+			playerLog.Error("invalid stat selected",
+				"stat", selectedStat,
+				"allowed", rule.Statistics.Statistics)
+
+			return false, status.Errorf(codes.InvalidArgument,
+				"player %s: invalid stat '%s'", player.PlayerID, selectedStat)
+		}
+
+		// Check if player has the selected stat (unless default is configured)
+		_, hasStat := player.Attributes[selectedStat]
+		if !hasStat && rule.Statistics.DefaultValue == 0 {
+			playerLog.Error("player missing selected stat value",
+				"stat", selectedStat)
+
+			return false, status.Errorf(codes.InvalidArgument,
+				"player %s: missing stat value for '%s'", player.PlayerID, selectedStat)
+		}
+
+		playerLog.Info("player validation passed", "selectedStat", selectedStat)
+	}
+
+	log.Info("ticket validation successful")
 
 	return true, nil
 }
 
-// EnrichTicket is responsible for adding logic to the match ticket before match making
-func (b MatchMaker) EnrichTicket(scope *common.Scope, matchTicket matchmaker.Ticket, ruleSet interface{}) (ticket matchmaker.Ticket, err error) {
-	scope.Log.Info("MATCHMAKER: enrich ticket")
-	if len(matchTicket.TicketAttributes) == 0 {
-		scope.Log.Info("MATCHMAKER: ticket attributes are empty, lets add some!")
-		enrichMap := map[string]interface{}{
-			"enrichedNumber": float64(20),
-		}
-		matchTicket.TicketAttributes = enrichMap
-		scope.Log.Info("EnrichedTicket Attributes", "ticketAttributes", matchTicket.TicketAttributes)
+// EnrichTicket extracts the selected stat value and adds it to ticket attributes
+func (b MatchMaker) EnrichTicket(scope *common.Scope, matchTicket matchmaker.Ticket, ruleSet interface{}) (matchmaker.Ticket, error) {
+	log := scope.Log.With("method", "MatchMaker.EnrichTicket", "ticketID", matchTicket.TicketID)
+	log.Info("enriching ticket")
+	log.Info("ticket/rules snapshot", "ticket", matchTicket, "rules", ruleSet)
+
+	rule, ok := ruleSet.(GameRules)
+	if !ok {
+		log.Error("unexpected game rule type", "type", fmt.Sprintf("%T", ruleSet))
+
+		return matchTicket, status.Error(codes.Internal, "invalid game rules type")
 	}
+
+	// If no statistics configured, skip enrichment
+	if len(rule.Statistics.Statistics) == 0 {
+		log.Info("no statistics config, skipping enrichment")
+
+		return matchTicket, nil
+	}
+
+	// Initialize ticket attributes if nil
+	if matchTicket.TicketAttributes == nil {
+		matchTicket.TicketAttributes = make(map[string]interface{})
+	}
+
+	// For party tickets, aggregate stat values (average)
+	var totalValue float64
+	var selectedStat string
+	playerCount := 0
+
+	for i, player := range matchTicket.Players {
+		playerLog := log.With("playerID", player.PlayerID)
+
+		// Get selected stat from ticket attributes using player ID
+		selectedStatRaw := matchTicket.TicketAttributes[string(player.PlayerID)]
+		currentStat, _ := selectedStatRaw.(string) // Already validated
+
+		if i == 0 {
+			selectedStat = currentStat
+		}
+
+		// Get value for the selected stat
+		valueRaw, exists := player.Attributes[currentStat]
+
+		var value float64
+		if exists {
+			switch v := valueRaw.(type) {
+			case float64:
+				value = v
+			case int:
+				value = float64(v)
+			case int64:
+				value = float64(v)
+			default:
+				playerLog.Warn("unexpected stat value type, using default", "type", fmt.Sprintf("%T", valueRaw))
+				value = rule.Statistics.DefaultValue
+			}
+		} else {
+			value = rule.Statistics.DefaultValue
+		}
+
+		totalValue += value
+		playerCount++
+		playerLog.Info("extracted stat value",
+			"stat", currentStat,
+			"value", value)
+	}
+
+	// Calculate average value for the ticket
+	var averageValue float64
+	if playerCount > 0 {
+		averageValue = totalValue / float64(playerCount)
+	}
+
+	// Add enriched attributes to ticket
+	enrichedKey := rule.Statistics.GetEnrichedKey()
+	matchTicket.TicketAttributes[enrichedKey] = averageValue
+
+	log.Info("ticket enriched",
+		enrichedKey, averageValue,
+		"selected_stat", selectedStat)
 
 	return matchTicket, nil
 }
 
-// GetStatCodes returns the string slice of the stat codes in matchrules
-func (b MatchMaker) GetStatCodes(scope *common.Scope, matchRules interface{}) []string {
-	scope.Log.Info("MATCHMAKER: stat codes", "codes", []string{})
-
-	return []string{}
-}
-
-// RulesFromJSON returns the ruleset from the Game rules
+// RulesFromJSON returns the ruleset from the Game rules JSON
 func (b MatchMaker) RulesFromJSON(scope *common.Scope, jsonRules string) (interface{}, error) {
 	var ruleSet GameRules
 	err := json.Unmarshal([]byte(jsonRules), &ruleSet)
@@ -64,262 +205,19 @@ func (b MatchMaker) RulesFromJSON(scope *common.Scope, jsonRules string) (interf
 		return nil, err
 	}
 
-	if ruleSet.AllianceRule.MinNumber > ruleSet.AllianceRule.MaxNumber {
-		return nil, status.Error(codes.InvalidArgument, "alliance rule MaxNumber is less than MinNumber")
-	}
-
-	if ruleSet.AllianceRule.PlayerMinNumber > ruleSet.AllianceRule.PlayerMaxNumber {
-		return nil, status.Error(codes.InvalidArgument, "alliance rule PlayerMaxNumber is less than PlayerMinNumber")
-	}
-
-	if ruleSet.ShipCountMin > ruleSet.ShipCountMax {
-		return nil, status.Error(codes.InvalidArgument, "ShipCountMax is less than ShipCountMin")
-	}
-
 	return ruleSet, nil
 }
 
-// MakeMatches iterates over all the match tickets and matches them based on the buildMatch function
+// MakeMatches returns nil to signal UNIMPLEMENTED - AGS will use default matching
 func (b MatchMaker) MakeMatches(scope *common.Scope, ticketProvider TicketProvider, matchRules interface{}) <-chan matchmaker.Match {
-	scope.Log.Info("MATCHMAKER: make matches")
-	log := scope.Log.With("method", "MATCHMAKER.MakeMatches")
-	results := make(chan matchmaker.Match)
-	ctx := scope.Ctx
+	scope.Log.Info("MakeMatches not implemented, delegating to AGS default matching")
 
-	rule, ok := matchRules.(GameRules)
-	if !ok {
-		log.Error("unexpected game rule type", "type", fmt.Sprintf("%T", matchRules))
-
-		return nil
-	}
-
-	go func() {
-		defer close(results)
-		var unmatchedTickets []matchmaker.Ticket
-		nextTicket := ticketProvider.GetTickets()
-		for {
-			select {
-			case ticket, ok := <-nextTicket:
-				if !ok {
-					scope.Log.Info("MATCHMAKER: there are no tickets to create a match with")
-
-					return
-				}
-				scope.Log.Info("MATCHMAKER: got a ticket", "ticketID", ticket.TicketID)
-				unmatchedTickets = buildMatch(scope, ticket, unmatchedTickets, rule, results)
-
-			case <-ctx.Done():
-				scope.Log.Info("MATCHMAKER: CTX Done triggered")
-
-				return
-			}
-		}
-	}()
-
-	return results
+	return nil
 }
 
-// buildMatch is responsible for building matches from the slice of match tickets and feeding them to the match channel
-func buildMatch(scope *common.Scope, ticket matchmaker.Ticket, unmatchedTickets []matchmaker.Ticket, rule GameRules, results chan matchmaker.Match) []matchmaker.Ticket {
-	scope.Log.Info("MATCHMAKER: seeing if we have enough tickets to match")
-	unmatchedTickets = append(unmatchedTickets, ticket)
-
-	minPlayers := rule.AllianceRule.MinNumber * rule.AllianceRule.PlayerMinNumber
-	maxPlayers := rule.AllianceRule.MaxNumber * rule.AllianceRule.PlayerMaxNumber
-
-	if minPlayers == 0 && maxPlayers == 0 {
-		minPlayers = 2
-		maxPlayers = 2
-	}
-
-	if rule.ShipCountMin == 0 {
-		minPlayers *= 1
-	} else {
-		minPlayers *= rule.ShipCountMin
-	}
-
-	if rule.ShipCountMax == 0 {
-		maxPlayers *= 1
-	} else {
-		maxPlayers *= rule.ShipCountMax
-	}
-
-	for {
-		if len(unmatchedTickets) < minPlayers {
-			break
-		}
-
-		numPlayers := minPlayers
-		if len(unmatchedTickets) >= maxPlayers {
-			numPlayers = maxPlayers
-		}
-
-		scope.Log.Info("MATCHMAKER: I have enough tickets to match!")
-
-		backfill := false
-		if rule.AutoBackfill && numPlayers < maxPlayers {
-			backfill = true
-		}
-
-		var players []playerdata.PlayerData
-
-		for i := 0; i < numPlayers; i++ {
-			players = append(players, unmatchedTickets[i].Players...)
-		}
-		playerIDs := pie_.Map(players, playerdata.ToID)
-
-		// RegionPreference value is just an example. The value(s) should be from the best region on the matchmaker.Ticket.Latencies
-		teamID := common.GenerateUUID()
-		match := matchmaker.Match{
-			RegionPreference: []string{"us-east-2", "us-west-2"},
-			Tickets:          make([]matchmaker.Ticket, numPlayers),
-			Teams: []matchmaker.Team{
-				{UserIDs: playerIDs, TeamID: teamID},
-			},
-			Backfill: backfill,
-			MatchAttributes: map[string]interface{}{
-				"assignment": map[string]interface{}{
-					"small-team-1": []string{teamID},
-				},
-			},
-		}
-		copy(match.Tickets, unmatchedTickets)
-		scope.Log.Info("MATCHMAKER: sending to results channel")
-		results <- match
-		scope.Log.Info("MATCHMAKER: reducing unmatched tickets",
-			"from", len(unmatchedTickets),
-			"to", len(unmatchedTickets)-numPlayers)
-		unmatchedTickets = unmatchedTickets[numPlayers:]
-	}
-
-	scope.Log.Info("MATCHMAKER: not enough tickets to build a match")
-
-	return unmatchedTickets
-}
-
+// BackfillMatches returns nil to signal UNIMPLEMENTED - AGS will use default backfill
 func (b MatchMaker) BackfillMatches(scope *common.Scope, ticketProvider TicketProvider, matchRules interface{}) <-chan matchmaker.BackfillProposal {
-	results := make(chan matchmaker.BackfillProposal)
-	ctx := scope.Ctx
+	scope.Log.Info("BackfillMatches not implemented, delegating to AGS default backfill")
 
-	scope.Log.With("method", "MatchMaker.BackfillMatches")
-	scope.Log.Info("start")
-
-	rule, ok := matchRules.(GameRules)
-	if !ok {
-		scope.Log.Error("unexpected game rule type", "type", fmt.Sprintf("%T", matchRules))
-
-		return nil
-	}
-
-	go func() {
-		defer func() {
-			close(results)
-			scope.Log.Info("end backfill")
-		}()
-		var unmatchedTickets []matchmaker.Ticket
-		var unmatchedBackfillTickets []matchmaker.BackfillTicket
-		nextTicket := ticketProvider.GetTickets()
-		nextBackfillTicket := ticketProvider.GetBackfillTickets()
-
-		for {
-			if nextTicket == nil && nextBackfillTicket == nil {
-				return
-			}
-
-			select {
-			case ticket, ok := <-nextTicket:
-				if !ok {
-					scope.Log.Info("no more match tickets")
-					nextTicket = nil
-
-					continue
-				}
-				scope.Log.Info("got a match ticket", "ticketId", ticket.TicketID)
-				unmatchedTickets, unmatchedBackfillTickets = buildBackfillMatch(scope, &ticket, nil, unmatchedTickets, unmatchedBackfillTickets, rule, results)
-			case backfillTicket, ok := <-nextBackfillTicket:
-				if !ok {
-					scope.Log.Info("no more backfill tickets")
-					nextBackfillTicket = nil
-
-					continue
-				}
-				scope.Log.Info("got a backfill ticket", "ticketId", backfillTicket.TicketID)
-				unmatchedTickets, unmatchedBackfillTickets = buildBackfillMatch(scope, nil, &backfillTicket, unmatchedTickets, unmatchedBackfillTickets, rule, results)
-			case <-ctx.Done():
-				scope.Log.Info("CTX Done triggered")
-
-				return
-			}
-		}
-	}()
-
-	return results
-}
-
-// buildBackfillMatch is responsible for building matches from the slice of match tickets and feeding them to the match channel
-func buildBackfillMatch(scope *common.Scope, newTicket *matchmaker.Ticket, newBackfillTicket *matchmaker.BackfillTicket, unmatchedTickets []matchmaker.Ticket, unmatchedBackfillTickets []matchmaker.BackfillTicket, rule GameRules, results chan matchmaker.BackfillProposal) ([]matchmaker.Ticket, []matchmaker.BackfillTicket) {
-	log := scope.Log.With("method", "MATCHMAKER.buildBackfillMatch")
-
-	if newTicket != nil {
-		unmatchedTickets = append(unmatchedTickets, *newTicket)
-	}
-	if newBackfillTicket != nil {
-		unmatchedBackfillTickets = append(unmatchedBackfillTickets, *newBackfillTicket)
-	}
-
-	log.Info("buildBackfillMatch",
-		"numBackfill", len(unmatchedBackfillTickets),
-		"numTicket", len(unmatchedTickets))
-
-	if len(unmatchedBackfillTickets) > 0 && len(unmatchedTickets) > 0 {
-		log.Info("I have enough tickets to backfill!")
-		var i int
-		var backfillTicket matchmaker.BackfillTicket
-		for i, backfillTicket = range unmatchedBackfillTickets {
-			ticket := unmatchedTickets[0]
-			unmatchedTickets = unmatchedTickets[1:]
-
-			if ticket.ExcludedSessions != nil && slices.Contains(ticket.ExcludedSessions, backfillTicket.MatchSessionID) {
-				log.Info("skip backfilling ticket to previous session",
-					"ticketID", ticket.TicketID,
-					"sessionID", backfillTicket.MatchSessionID)
-				continue
-			}
-
-			proposedTeam := backfillTicket.PartialMatch.Teams
-			proposedTeam = append(proposedTeam, matchmaker.Team{
-				UserIDs: pie_.Map(ticket.Players, playerdata.ToID),
-				Parties: matchfunction.PlayerDataToParties(ticket.Players),
-				TeamID:  common.GenerateUUID(),
-			})
-
-			log.Info("Send backfill proposal!")
-			proposedAttributes := backfillTicket.PartialMatch.MatchAttributes
-			proposedAttributes["generatedID"] = common.GenerateUUID()
-			results <- matchmaker.BackfillProposal{
-				BackfillTicketID: backfillTicket.TicketID,
-				CreatedAt:        time.Time{},
-				AddedTickets:     []matchmaker.Ticket{ticket},
-				ProposedTeams:    proposedTeam,
-				ProposalID:       common.GenerateUUID(),
-				MatchPool:        backfillTicket.MatchPool,
-				MatchSessionID:   backfillTicket.MatchSessionID,
-				Attributes:       proposedAttributes,
-			}
-
-			if len(unmatchedTickets) == 0 {
-				if i+1 < len(unmatchedBackfillTickets) {
-					unmatchedBackfillTickets = unmatchedBackfillTickets[i+1:]
-				} else {
-					unmatchedBackfillTickets = nil
-				}
-
-				break
-			}
-		}
-	} else {
-		log.Info("not enough tickets to build a match")
-	}
-
-	return unmatchedTickets, unmatchedBackfillTickets
+	return nil
 }
