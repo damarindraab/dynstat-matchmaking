@@ -63,48 +63,20 @@ func (b MatchMaker) ValidateTicket(scope *common.Scope, matchTicket matchmaker.T
 		return true, nil
 	}
 
-	// Validate each player in the ticket
+	enrichedKey := rule.Statistics.GetEnrichedKey()
+
+	// Validate each player has the enriched attribute
 	for _, player := range matchTicket.Players {
 		playerLog := log.With("playerID", player.PlayerID)
 
-		// Get selected stat from ticket attributes using player ID
-		selectedStatRaw, exists := matchTicket.TicketAttributes[string(player.PlayerID)]
-		if !exists {
-			playerLog.Error("player missing selected stat mapping", "key", player.PlayerID)
+		if _, exists := player.Attributes[enrichedKey]; !exists {
+			playerLog.Error("player missing enriched attribute", "key", enrichedKey)
 
 			return false, status.Errorf(codes.InvalidArgument,
-				"player %s missing required stat mapping", player.PlayerID)
+				"player %s: missing enriched attribute '%s'", player.PlayerID, enrichedKey)
 		}
 
-		selectedStat, ok := selectedStatRaw.(string)
-		if !ok {
-			playerLog.Error("selected stat is not a string", "value", selectedStatRaw)
-
-			return false, status.Errorf(codes.InvalidArgument,
-				"player %s: selected stat must be a string", player.PlayerID)
-		}
-
-		// Validate stat is in allowed list
-		if !rule.Statistics.IsValidStat(selectedStat) {
-			playerLog.Error("invalid stat selected",
-				"stat", selectedStat,
-				"allowed", rule.Statistics.Statistics)
-
-			return false, status.Errorf(codes.InvalidArgument,
-				"player %s: invalid stat '%s'", player.PlayerID, selectedStat)
-		}
-
-		// Check if player has the selected stat (unless default is configured)
-		_, hasStat := player.Attributes[selectedStat]
-		if !hasStat && rule.Statistics.DefaultValue == 0 {
-			playerLog.Error("player missing selected stat value",
-				"stat", selectedStat)
-
-			return false, status.Errorf(codes.InvalidArgument,
-				"player %s: missing stat value for '%s'", player.PlayerID, selectedStat)
-		}
-
-		playerLog.Info("player validation passed", "selectedStat", selectedStat)
+		playerLog.Info("player validation passed")
 	}
 
 	log.Info("ticket validation successful")
@@ -132,67 +104,62 @@ func (b MatchMaker) EnrichTicket(scope *common.Scope, matchTicket matchmaker.Tic
 		return matchTicket, nil
 	}
 
-	// Initialize ticket attributes if nil
-	if matchTicket.TicketAttributes == nil {
-		matchTicket.TicketAttributes = make(map[string]interface{})
-	}
+	enrichedKey := rule.Statistics.GetEnrichedKey()
 
-	// For party tickets, aggregate stat values (average)
-	var totalValue float64
-	var selectedStat string
-	playerCount := 0
-
+	// For each player, set enriched attribute and remove configured stats
 	for i, player := range matchTicket.Players {
 		playerLog := log.With("playerID", player.PlayerID)
 
 		// Get selected stat from ticket attributes using player ID
 		selectedStatRaw := matchTicket.TicketAttributes[string(player.PlayerID)]
-		currentStat, _ := selectedStatRaw.(string) // Already validated
+		selectedStat, _ := selectedStatRaw.(string)
 
-		if i == 0 {
-			selectedStat = currentStat
-		}
+		// Try to get and set the enriched value
+		enriched := false
+		valueRaw, exists := player.Attributes[selectedStat]
 
-		// Get value for the selected stat
-		valueRaw, exists := player.Attributes[currentStat]
-
-		var value float64
 		if exists {
+			var value float64
+
 			switch v := valueRaw.(type) {
 			case float64:
 				value = v
+				enriched = true
 			case int:
 				value = float64(v)
+				enriched = true
 			case int64:
 				value = float64(v)
+				enriched = true
 			default:
-				playerLog.Warn("unexpected stat value type, using default", "type", fmt.Sprintf("%T", valueRaw))
-				value = rule.Statistics.DefaultValue
+				playerLog.Warn("unexpected stat value type", "type", fmt.Sprintf("%T", valueRaw))
+			}
+
+			if enriched {
+				// Initialize player attributes if nil
+				if matchTicket.Players[i].Attributes == nil {
+					matchTicket.Players[i].Attributes = make(map[string]interface{})
+				}
+
+				matchTicket.Players[i].Attributes[enrichedKey] = value
+				playerLog.Info("player enriched", "selectedStat", selectedStat, "value", value)
 			}
 		} else {
-			value = rule.Statistics.DefaultValue
+			playerLog.Warn("player missing selected stat", "stat", selectedStat)
 		}
 
-		totalValue += value
-		playerCount++
-		playerLog.Info("extracted stat value",
-			"stat", currentStat,
-			"value", value)
+		// Always remove configured statistics from player attributes
+		for _, stat := range rule.Statistics.Statistics {
+			delete(matchTicket.Players[i].Attributes, stat)
+		}
 	}
 
-	// Calculate average value for the ticket
-	var averageValue float64
-	if playerCount > 0 {
-		averageValue = totalValue / float64(playerCount)
+	// Clean up player ID mappings - no longer needed after enrichment
+	for _, player := range matchTicket.Players {
+		delete(matchTicket.TicketAttributes, string(player.PlayerID))
 	}
 
-	// Add enriched attributes to ticket
-	enrichedKey := rule.Statistics.GetEnrichedKey()
-	matchTicket.TicketAttributes[enrichedKey] = averageValue
-
-	log.Info("ticket enriched",
-		enrichedKey, averageValue,
-		"selected_stat", selectedStat)
+	log.Info("ticket enriched", "enrichedKey", enrichedKey)
 
 	return matchTicket, nil
 }

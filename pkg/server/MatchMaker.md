@@ -1,24 +1,38 @@
-# Custom MatchMaker - Basic
+# Custom MatchMaker - Dynamic Stat Selection
 
 ## Summary
-The matchmaker.go file is an example of a Basic Custom MatchMaker that will match 2 tickets
-without any checks. Below are descriptions of what each of these MatchMaker's functions are do.
 
-### ValidateTicket()
-Does not perform a validation check and returns `true`, making the ticket valid.
+The matchmaker.go file implements a dynamic stat-based matchmaking system. Players select which stat to use for matching (e.g., character-specific MMR), and the server normalizes this into a standard attribute for AGS matching.
 
-### EnrichTicket()
-Checks if the match ticket's `TicketAttributes` map is empty -- if so, it will add in a
-key-value number.
+## Functions
 
 ### GetStatCodes()
-Returns an empty string slice.
+
+Returns the list of stat codes configured in `statistics_config.statistics`. AGS uses this to know which player statistics to fetch.
+
+### EnrichTicket()
+
+For each player in the ticket:
+1. Gets the selected stat code from `TicketAttributes[playerID]`
+2. Extracts the stat value from `Player.Attributes[selectedStat]`
+3. Sets `Player.Attributes[enrichedKey]` to the stat value
+4. Removes all configured statistics from `Player.Attributes`
+5. Cleans up player ID mappings from `TicketAttributes`
+
+If a player is missing the selected stat or it has an invalid type, the enriched key is not set (validation will fail).
+
+### ValidateTicket()
+
+Checks that each player has the enriched attribute in their `Player.Attributes`. This is a post-enrichment validation - if any player is missing the enriched key, validation fails.
 
 ### RulesFromJSON()
-Unmarshals the json rules string to the appropriate ruleSet `(GameRules)` and returns them
-as an interface.
+
+Unmarshals the JSON rules string to `GameRules` struct and returns it.
 
 ### MakeMatches()
-Creates a `results` go channel and invokes `GetTickets()` from the `TicketProvider` interface. Next,
-select each ticket and (if there are tickets in the channel) call `buildMatch`, which will dumbly
-match any 2 tickets and send them to the created `results` channel.
+
+Returns `nil` to signal `UNIMPLEMENTED`. AGS uses its default matching logic based on the enriched player attributes.
+
+### BackfillMatches()
+
+Returns `nil` to signal `UNIMPLEMENTED`. AGS uses its default backfill logic.

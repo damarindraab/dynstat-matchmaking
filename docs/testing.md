@@ -23,7 +23,7 @@ You can test the app locally and against AGS.
    ```json
    {
        "rules": {
-           "json": "{\"statistics_config\":{\"statistics\":[\"mmr_ryu\",\"mmr_ken\",\"mmr_chun-li\"],\"default_value\":1000}}"
+           "json": "{\"statistics_config\":{\"statistics\":[\"mmr_ryu\",\"mmr_ken\",\"mmr_chun-li\"]}}"
        }
    }
    ```
@@ -57,7 +57,7 @@ You can test the app locally and against AGS.
            }
        },
        "rules": {
-           "json": "{\"statistics_config\":{\"statistics\":[\"mmr_ryu\",\"mmr_ken\",\"mmr_chun-li\"],\"default_value\":1000}}"
+           "json": "{\"statistics_config\":{\"statistics\":[\"mmr_ryu\",\"mmr_ken\",\"mmr_chun-li\"]}}"
        }
    }
    ```
@@ -91,7 +91,7 @@ You can test the app locally and against AGS.
            }
        },
        "rules": {
-           "json": "{\"statistics_config\":{\"statistics\":[\"mmr_ryu\",\"mmr_ken\",\"mmr_chun-li\"],\"enriched_key\":\"mmr\",\"default_value\":1000}}"
+           "json": "{\"statistics_config\":{\"statistics\":[\"mmr_ryu\",\"mmr_ken\",\"mmr_chun-li\"],\"enriched_key\":\"mmr\"}}"
        }
    }
    ```
